@@ -4,6 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gestor de Pagos de Servicios</title>
+    
+    <!-- ETIQUETAS PWA Y MANIFEST PARA IPHONE -->
+    <link rel="manifest" href="manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/3135/3135679.png">
+
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Lucide Icons -->
@@ -13,9 +20,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
         import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
-        // Se agregó 'setDoc' a la importación de Firestore
         import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, query, where, writeBatch, setDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
-        // Importaciones para Notificaciones Push
         import { getMessaging, getToken, onMessage } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging.js";
 
         const firebaseConfig = {
@@ -30,7 +35,7 @@
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
-        const messaging = getMessaging(app); // Inicializar Messaging
+        const messaging = getMessaging(app);
 
         let currentUser = null;
         let currentMonth = new Date().getMonth();
@@ -84,19 +89,32 @@
             });
         }
 
-        // === NUEVA FUNCIÓN: Solicitar permiso y guardar Token de Notificación ===
+        // === FUNCIÓN CORREGIDA PARA EVITAR EL ERROR DE SERVICE WORKER ===
         async function requestNotificationPermission() {
             try {
+                if (!('serviceWorker' in navigator)) {
+                    alert('Tu navegador no soporta notificaciones push.');
+                    return;
+                }
+
                 const permission = await Notification.requestPermission();
                 if (permission === 'granted') {
-                    // Tu clave VAPID pública
+                    // Registrar el Service Worker manualmente
+                    const swRegistration = await navigator.serviceWorker.register('/firebase-messaging-sw.js');
+                    
+                    // Esperar a que esté listo
+                    await navigator.serviceWorker.ready;
+
                     const vapidKey = "BF2o-B4Z1UWqtNixXpkO0IPtOTUCxiLnyob4Vr2arwA4Ke8MQhmaplFYsoooo52Qcgjl_dUY1nJov1J9vFRdF-o";
                     
-                    const token = await getToken(messaging, { vapidKey: vapidKey });
+                    // Pasar el registro al getToken
+                    const token = await getToken(messaging, { 
+                        vapidKey: vapidKey,
+                        serviceWorkerRegistration: swRegistration 
+                    });
                     
                     if (token) {
                         console.log('Token de notificación obtenido:', token);
-                        // Guardar en Firestore vinculado al usuario actual
                         await setDoc(doc(db, 'tokens_notificaciones', currentUser.uid), {
                             token: token,
                             userId: currentUser.uid,
@@ -165,8 +183,6 @@
             });
 
             document.getElementById('logout-btn').addEventListener('click', () => signOut(auth));
-
-            // Listener para el botón de notificaciones
             document.getElementById('btn-notifications').addEventListener('click', requestNotificationPermission);
 
             document.getElementById('select-month').addEventListener('change', async (e) => { currentMonth = parseInt(e.target.value); await renderFilteredData(); });
@@ -562,7 +578,6 @@
                                 ${s.proof ? `<button onclick="window.viewProof('${s.id}')" class="inline-flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 hover:underline mt-1.5 touch-manipulation"><i data-lucide="eye" class="w-3.5 h-3.5"></i> Ver Comprobante</button>` : ''}
                             </div>
                             
-                            <!-- Botones apilados en móvil, en línea en PC -->
                             <div class="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 w-full sm:w-auto mt-1 sm:mt-0">
                                 <div class="col-span-2 sm:col-span-1 mb-1 sm:mb-0">
                                     ${badge}
@@ -872,7 +887,6 @@
                 </div>
             </div>
             <div class="flex items-center gap-2">
-                <!-- BOTÓN DE NOTIFICACIONES AGREGADO AQUÍ -->
                 <button id="btn-notifications" class="px-2 sm:px-3 py-2 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 border border-emerald-500/30 rounded-xl text-xs sm:text-sm font-medium transition flex items-center gap-2 touch-manipulation" title="Activar Recordatorios">
                     <i data-lucide="bell" class="w-4 h-4"></i> <span class="hidden sm:inline">Recordatorios</span>
                 </button>

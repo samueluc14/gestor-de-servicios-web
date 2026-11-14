@@ -1,6 +1,5 @@
 const admin = require('firebase-admin');
 
-// Las credenciales se leen desde los Secrets de GitHub Actions
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
@@ -8,13 +7,24 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
+// Función para obtener la fecha en formato YYYY-MM-DD en la zona horaria de Chile
+function getFechaChile(dateObj) {
+    return new Intl.DateTimeFormat('en-CA', { 
+        timeZone: 'America/Santiago',
+        year: 'numeric', month: '2-digit', day: '2-digit' 
+    }).format(dateObj);
+}
+
 async function sendReminders() {
     const today = new Date();
-    const todayStr = today.toISOString().split('T')[0]; 
     
+    // Fecha de HOY en Chile
+    const todayStr = getFechaChile(today); 
+    
+    // Fecha de hace 3 días en Chile
     const threeDaysFromNow = new Date(today);
     threeDaysFromNow.setDate(today.getDate() + 3);
-    const threeDaysStr = threeDaysFromNow.toISOString().split('T')[0];
+    const threeDaysStr = getFechaChile(threeDaysFromNow);
 
     console.log(`Buscando vencimientos para hoy (${todayStr}) y en 3 días (${threeDaysStr})...`);
 
