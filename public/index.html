@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gestor de Pagos de Servicios</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <!-- Firebase SDKs por CDN -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+        import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+        // Se agregó 'setDoc' a la importación de Firestore
+        import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, query, where, writeBatch, setDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+        // Importaciones para Notificaciones Push
+        import { getMessaging, getToken, onMessage } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyCVg6257crDKMc-Rnt3BNm2DF7RXnCdgjc",
+            authDomain: "gestor-de-servicios-17324.firebaseapp.com",
+            projectId: "gestor-de-servicios-17324",
+            storageBucket: "gestor-de-servicios-17324.firebasestorage.app",
+            messagingSenderId: "933565685122",
+            appId: "1:933565685122:web:6ca27f0886f1780f55839b"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const messaging = getMessaging(app); // Inicializar Messaging
+
+        let currentUser = null;
+        let currentMonth = new Date().getMonth();
+        let currentYear = new Date().getFullYear();
+        let isRegistering = false;
+        
+        let cachedServicios = [];
+        let cachedCasas = [];
+        let allUserServicios = [];
+        let plantillasCache = [];
+
+        const MONTH_NAMES = [
+            "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+        ];
+
+        const formatCLP = (amount) => '$' + Number(amount || 0).toLocaleString('es-CL');
+
+        function buildDateForMonth(year, month, day) {
+            const maxDay = new Date(year, month + 1, 0).getDate();
+            const safeDay = Math.min(Math.max(1, parseInt(day) || 1), maxDay);
+            const mStr = String(month + 1).padStart(2, '0');
+            const dStr = String(safeDay).padStart(2, '0');
+            return `${year}-${mStr}-${dStr}`;
+        }
+
+        function compressImage(file, maxWidth = 900, quality = 0.72) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        const canvas = document.createElement('canvas');
+                        let width = img.width;
+                        let height = img.height;
+                        if (width > maxWidth) {
+                            height = Math.round((height * maxWidth) / width);
+                            width = maxWidth;
+                        }
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, width, height);
+                        resolve(canvas.toDataURL('image/jpeg', quality));
+                    };
+                    img.onerror = reject;
+                    img.src = e.target.result;
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        // === NUEVA FUNCIÓN: Solicitar permiso y guardar Token de Notificación ===
+        async function requestNotificationPermission() {
+            try {
+                const permission = await Notification.requestPermission();
+                if (permission === 'granted') {
+                    // Tu clave VAPID pública
+                    const vapidKey = "BF2o-B4Z1UWqtNixXpkO0IPtOTUCxiLnyob4Vr2arwA4Ke8MQhmaplFYsoooo52Qcgjl_dUY1nJov1J9vFRdF-o";
+                    
+                    const token = await getToken(messaging, { vapidKey: vapidKey });
+                    
+                    if (token) {
+                        console.log('Token de notificación obtenido:', token);
+                        // Guardar en Firestore vinculado al usuario actual
+                        await setDoc(doc(db, 'tokens_notificaciones', currentUser.uid), {
+                            token: token,
+                            userId: currentUser.uid,
+                            updatedAt: new Date().toISOString()
+                        });
+                        alert('¡Notificaciones activadas! Recibirás recordatorios en este dispositivo.');
+                    } else {
+                        console.log('No se pudo obtener el token.');
+                    }
+                } else {
+                    alert('Has denegado el permiso. Para activarlas, hazlo desde la configuración de tu navegador.');
+                }
+            } catch (error) {
+                console.error('Error al solicitar permiso:', error);
+                alert('Error al configurar notificaciones: ' + error.message);
+            }
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('select-month').value = currentMonth;
+            document.getElementById('select-year').value = currentYear;
+
+            onAuthStateChanged(auth, (user) => {
+                if (user) {
+                    currentUser = user;
+                    document.getElementById('user-email-display').innerText = user.email;
+                    document.getElementById('auth-container').classList.add('hidden');
+                    document.getElementById('app-container').classList.remove('hidden');
+                    loadData();
+                } else {
+                    currentUser = null;
+                    document.getElementById('auth-container').classList.remove('hidden');
+                    document.getElementById('app-container').classList.add('hidden');
+                }
+            });
+
+            setupListeners();
+        });
+
+        function setupListeners() {
+            document.getElementById('auth-toggle-mode').addEventListener('click', () => {
+                isRegistering = !isRegistering;
+                document.getElementById('auth-title').innerText = isRegistering ? 'Crear Cuenta Nueva' : 'Iniciar Sesión';
+                document.getElementById('auth-subtitle').innerText = isRegistering ? 'Registra tu correo para respaldar tus datos en la nube' : 'Ingresa a tus servicios en la nube';
+                document.getElementById('auth-submit-btn').innerText = isRegistering ? 'Registrarse' : 'Iniciar Sesión';
+                document.getElementById('auth-toggle-mode').innerText = isRegistering ? '¿Ya tienes cuenta? Inicia sesión aquí' : '¿No tienes cuenta? Regístrate';
+            });
+
+            document.getElementById('auth-form').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const email = document.getElementById('auth-email').value;
+                const password = document.getElementById('auth-password').value;
+                const errorBox = document.getElementById('auth-error');
+                errorBox.classList.add('hidden');
+
+                try {
+                    if (isRegistering) {
+                        await createUserWithEmailAndPassword(auth, email, password);
+                    } else {
+                        await signInWithEmailAndPassword(auth, email, password);
+                    }
+                } catch (error) {
+                    errorBox.innerText = 'Error: ' + error.message;
+                    errorBox.classList.remove('hidden');
+                }
+            });
+
+            document.getElementById('logout-btn').addEventListener('click', () => signOut(auth));
+
+            // Listener para el botón de notificaciones
+            document.getElementById('btn-notifications').addEventListener('click', requestNotificationPermission);
+
+            document.getElementById('select-month').addEventListener('change', async (e) => { currentMonth = parseInt(e.target.value); await renderFilteredData(); });
+            document.getElementById('select-year').addEventListener('change', async (e) => { currentYear = parseInt(e.target.value); await renderFilteredData(); });
+            document.getElementById('prev-month').addEventListener('click', async () => {
+                currentMonth--; if (currentMonth < 0) { currentMonth = 11; currentYear--; }
+                document.getElementById('select-month').value = currentMonth; document.getElementById('select-year').value = currentYear; await renderFilteredData();
+            });
+            document.getElementById('next-month').addEventListener('click', async () => {
+                currentMonth++; if (currentMonth > 11) { currentMonth = 0; currentYear++; }
+                document.getElementById('select-month').value = currentMonth; document.getElementById('select-year').value = currentYear; await renderFilteredData();
+            });
+
+            document.getElementById('btn-add-house').addEventListener('click', () => document.getElementById('modal-house').classList.remove('hidden'));
+            document.getElementById('close-modal-house').addEventListener('click', () => document.getElementById('modal-house').classList.add('hidden'));
+            
+            document.getElementById('form-house').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const name = document.getElementById('house-name').value.trim();
+                if (!name) return;
+                
+                document.getElementById('modal-house').classList.add('hidden');
+                document.getElementById('house-name').value = '';
+                
+                const docRef = await addDoc(collection(db, 'casas'), { userId: currentUser.uid, name });
+                cachedCasas.push({ id: docRef.id, userId: currentUser.uid, name });
+                await renderFilteredData();
+            });
+
+            document.getElementById('close-modal-service').addEventListener('click', () => document.getElementById('modal-service').classList.add('hidden'));
+            
+            const isRecurringCheckbox = document.getElementById('service-is-recurring');
+            const isFixedAmountCheckbox = document.getElementById('service-is-fixed-amount');
+            const recurringOptionsBox = document.getElementById('recurring-options-box');
+            const fixedDayBox = document.getElementById('fixed-day-box');
+
+            isRecurringCheckbox.addEventListener('change', () => {
+                if (isRecurringCheckbox.checked) {
+                    recurringOptionsBox.classList.remove('hidden');
+                } else {
+                    recurringOptionsBox.classList.add('hidden');
+                    isFixedAmountCheckbox.checked = false;
+                    fixedDayBox.classList.add('hidden');
+                }
+            });
+
+            isFixedAmountCheckbox.addEventListener('change', () => {
+                if (isFixedAmountCheckbox.checked) {
+                    fixedDayBox.classList.remove('hidden');
+                    const currentDue = document.getElementById('service-duedate').value;
+                    if (currentDue && !document.getElementById('service-fixed-day').value) {
+                        document.getElementById('service-fixed-day').value = parseInt(currentDue.split('-')[2]);
+                    }
+                } else {
+                    fixedDayBox.classList.add('hidden');
+                }
+            });
+
+            document.getElementById('form-service').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const houseId = document.getElementById('service-house-id').value;
+                const name = document.getElementById('service-name').value.trim();
+                const rawAmount = document.getElementById('service-amount').value;
+                const amount = rawAmount === '' ? 0 : parseFloat(rawAmount);
+                const dueDate = document.getElementById('service-duedate').value || null;
+                
+                const isRecurring = isRecurringCheckbox.checked;
+                const isFixedAmount = isFixedAmountCheckbox.checked;
+                const fixedDay = parseInt(document.getElementById('service-fixed-day').value) || (dueDate ? parseInt(dueDate.split('-')[2]) : null);
+
+                let templateId = null;
+
+                if (isRecurring) {
+                    const tplRef = await addDoc(collection(db, 'plantillas_servicios'), {
+                        userId: currentUser.uid,
+                        houseId,
+                        name,
+                        isFixedAmount,
+                        fixedAmount: isFixedAmount ? amount : 0,
+                        fixedDay: isFixedAmount ? fixedDay : null,
+                        startYear: currentYear,
+                        startMonth: currentMonth
+                    });
+                    templateId = tplRef.id;
+                    plantillasCache.push({ id: templateId, userId: currentUser.uid, houseId, name, isFixedAmount, fixedAmount: isFixedAmount ? amount : 0, fixedDay, startYear: currentYear, startMonth: currentMonth });
+                }
+
+                const finalDueDate = (isRecurring && isFixedAmount && !dueDate && fixedDay)
+                    ? buildDateForMonth(currentYear, currentMonth, fixedDay)
+                    : dueDate;
+
+                const newServData = {
+                    userId: currentUser.uid,
+                    houseId,
+                    templateId,
+                    name,
+                    amount,
+                    dueDate: finalDueDate,
+                    isFixedAmount,
+                    month: currentMonth,
+                    year: currentYear,
+                    status: 'pendiente',
+                    paymentDate: null,
+                    proof: null
+                };
+
+                const docRef = await addDoc(collection(db, 'servicios'), newServData);
+                newServData.id = docRef.id;
+                
+                cachedServicios.push(newServData);
+                allUserServicios.push(newServData);
+
+                document.getElementById('form-service').reset();
+                recurringOptionsBox.classList.add('hidden');
+                fixedDayBox.classList.add('hidden');
+                document.getElementById('modal-service').classList.add('hidden');
+                renderFilteredData();
+            });
+
+            document.getElementById('close-modal-edit-service').addEventListener('click', () => document.getElementById('modal-edit-service').classList.add('hidden'));
+            document.getElementById('form-edit-service').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const id = document.getElementById('edit-service-id').value;
+                const templateId = document.getElementById('edit-service-template-id').value;
+                const name = document.getElementById('edit-service-name').value.trim();
+                const rawAmount = document.getElementById('edit-service-amount').value;
+                const amount = rawAmount === '' ? 0 : parseFloat(rawAmount);
+                const dueDate = document.getElementById('edit-service-duedate').value || null;
+                const updateTemplate = document.getElementById('edit-update-template').checked;
+
+                document.getElementById('modal-edit-service').classList.add('hidden');
+
+                const servAll = allUserServicios.find(s => s.id === id);
+                if (servAll) { servAll.name = name; servAll.amount = amount; servAll.dueDate = dueDate; }
+                const servCached = cachedServicios.find(s => s.id === id);
+                if (servCached) { servCached.name = name; servCached.amount = amount; servCached.dueDate = dueDate; }
+                
+                renderFilteredData();
+
+                await updateDoc(doc(db, 'servicios', id), { name, amount, dueDate });
+
+                if (templateId && updateTemplate) {
+                    const tplUpdate = { name };
+                    if (servAll && servAll.isFixedAmount) {
+                        tplUpdate.fixedAmount = amount;
+                        if (dueDate) tplUpdate.fixedDay = parseInt(dueDate.split('-')[2]);
+                    }
+                    await updateDoc(doc(db, 'plantillas_servicios', templateId), tplUpdate);
+                    const tplCache = plantillasCache.find(p => p.id === templateId);
+                    if (tplCache) { tplCache.name = name; if(tplUpdate.fixedAmount) tplCache.fixedAmount = amount; }
+                }
+            });
+
+            document.getElementById('close-modal-templates').addEventListener('click', () => document.getElementById('modal-templates').classList.add('hidden'));
+
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    window.closeProofModal();
+                }
+            });
+        }
+
+        async function loadData() {
+            if (!currentUser) return;
+            const [snapCasas, snapAllServ, snapTpl] = await Promise.all([
+                getDocs(query(collection(db, 'casas'), where('userId', '==', currentUser.uid))),
+                getDocs(query(collection(db, 'servicios'), where('userId', '==', currentUser.uid))),
+                getDocs(query(collection(db, 'plantillas_servicios'), where('userId', '==', currentUser.uid)))
+            ]);
+
+            cachedCasas = []; snapCasas.forEach(d => cachedCasas.push({ id: d.id, ...d.data() }));
+            allUserServicios = []; snapAllServ.forEach(d => allUserServicios.push({ id: d.id, ...d.data() }));
+            plantillasCache = []; snapTpl.forEach(d => plantillasCache.push({ id: d.id, ...d.data() }));
+
+            await renderFilteredData();
+        }
+
+        async function renderFilteredData() {
+            cachedServicios = allUserServicios.filter(s => s.month === currentMonth && s.year === currentYear);
+
+            for (const tpl of plantillasCache) {
+                const isAfterOrEqualStart = (currentYear > tpl.startYear) || (currentYear === tpl.startYear && currentMonth >= tpl.startMonth);
+                if (!isAfterOrEqualStart) continue;
+
+                const houseExists = cachedCasas.some(c => c.id === tpl.houseId);
+                if (!houseExists) continue;
+
+                const existsThisMonth = cachedServicios.some(s => s.templateId === tpl.id);
+                if (!existsThisMonth) {
+                    const dueDate = (tpl.isFixedAmount && tpl.fixedDay)
+                        ? buildDateForMonth(currentYear, currentMonth, tpl.fixedDay)
+                        : null;
+                    const amount = tpl.isFixedAmount ? Number(tpl.fixedAmount || 0) : 0;
+
+                    const newServData = {
+                        userId: currentUser.uid,
+                        houseId: tpl.houseId,
+                        templateId: tpl.id,
+                        name: tpl.name,
+                        amount: amount,
+                        dueDate: dueDate,
+                        isFixedAmount: !!tpl.isFixedAmount,
+                        month: currentMonth,
+                        year: currentYear,
+                        status: 'pendiente',
+                        paymentDate: null,
+                        proof: null
+                    };
+
+                    const newDoc = await addDoc(collection(db, 'servicios'), newServData);
+                    const createdObj = { id: newDoc.id, ...newServData };
+                    cachedServicios.push(createdObj);
+                    allUserServicios.push(createdObj);
+                }
+            }
+
+            renderApp(cachedCasas, cachedServicios, allUserServicios, plantillasCache);
+        }
+
+        function updateMonthStatusBanner(serviciosMes, allServicios) {
+            const badgeEl = document.getElementById('month-status-badge');
+            const lastPaidEl = document.getElementById('last-paid-month-text');
+            const pendingSummaryBox = document.getElementById('pending-summary-box');
+            const pendingListEl = document.getElementById('pending-items-list');
+
+            if (serviciosMes.length === 0) {
+                badgeEl.className = "px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-slate-700/80 text-slate-400 border border-slate-600 text-center w-full sm:w-auto mt-2 sm:mt-0";
+                badgeEl.innerText = "SIN CUENTAS";
+            } else {
+                const allPaid = serviciosMes.every(s => s.status === 'pagado');
+                const anyOverdue = serviciosMes.some(s => s.status !== 'pagado' && s.dueDate && s.dueDate < new Date().toISOString().split('T')[0]);
+                
+                if (allPaid) {
+                    badgeEl.className = "px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 flex items-center justify-center w-full sm:w-auto mt-2 sm:mt-0 gap-1.5";
+                    badgeEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span> PAGADO`;
+                } else if (anyOverdue) {
+                    badgeEl.className = "px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-rose-500/20 text-rose-400 border border-rose-500/40 flex items-center justify-center w-full sm:w-auto mt-2 sm:mt-0 gap-1.5";
+                    badgeEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-rose-400 animate-pulse"></span> VENCIDO / PENDIENTE`;
+                } else {
+                    badgeEl.className = "px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-amber-500/20 text-amber-400 border border-amber-500/40 flex items-center justify-center w-full sm:w-auto mt-2 sm:mt-0 gap-1.5";
+                    badgeEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span> PENDIENTE`;
+                }
+            }
+
+            const groupedByMonth = {};
+            allServicios.forEach(s => {
+                const key = `${s.year}-${String(s.month).padStart(2, '0')}`;
+                if (!groupedByMonth[key]) {
+                    groupedByMonth[key] = { year: s.year, month: s.month, items: [] };
+                }
+                groupedByMonth[key].items.push(s);
+            });
+
+            const sortedKeys = Object.keys(groupedByMonth).sort().reverse();
+            let lastFullyPaidMonth = null;
+            let lastAnyPaidMonth = null;
+
+            for (const key of sortedKeys) {
+                const grp = groupedByMonth[key];
+                const hasAnyPaid = grp.items.some(i => i.status === 'pagado');
+                const isFullyPaid = grp.items.length > 0 && grp.items.every(i => i.status === 'pagado');
+
+                if (isFullyPaid && !lastFullyPaidMonth) {
+                    lastFullyPaidMonth = grp;
+                }
+                if (hasAnyPaid && !lastAnyPaidMonth) {
+                    lastAnyPaidMonth = grp;
+                }
+            }
+
+            if (lastFullyPaidMonth) {
+                lastPaidEl.innerHTML = `<span class="text-emerald-400 font-bold">${MONTH_NAMES[lastFullyPaidMonth.month]} ${lastFullyPaidMonth.year}</span> <span class="text-slate-400 text-xs">(100% saldado)</span>`;
+            } else if (lastAnyPaidMonth) {
+                const paidCount = lastAnyPaidMonth.items.filter(i => i.status === 'pagado').length;
+                lastPaidEl.innerHTML = `<span class="text-amber-300 font-semibold">${MONTH_NAMES[lastAnyPaidMonth.month]} ${lastAnyPaidMonth.year}</span> <span class="text-slate-400 text-xs">(Parcial: ${paidCount}/${lastAnyPaidMonth.items.length} pagadas)</span>`;
+            } else {
+                lastPaidEl.innerHTML = `<span class="text-slate-500 italic">Aún no hay meses pagados</span>`;
+            }
+
+            const pendingThisMonth = serviciosMes.filter(s => s.status !== 'pagado');
+            if (pendingThisMonth.length > 0) {
+                pendingSummaryBox.classList.remove('hidden');
+                pendingListEl.innerHTML = pendingThisMonth.map(s => {
+                    const houseObj = cachedCasas.find(c => c.id === s.houseId);
+                    const houseLabel = houseObj ? houseObj.name : 'Casa';
+                    const amtLabel = Number(s.amount || 0) > 0 ? formatCLP(s.amount) : 'Monto por ingresar';
+                    const dueLabel = s.dueDate ? `Vence ${s.dueDate}` : 'Sin fecha';
+                    return `
+                        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 sm:gap-2 bg-slate-900/90 border border-slate-700/80 px-3 py-2.5 rounded-xl text-xs">
+                            <div class="flex items-center gap-2">
+                                <span class="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0"></span>
+                                <span class="font-semibold text-slate-200 truncate">${s.name}</span>
+                                <span class="text-slate-500 text-[10px] truncate">(${houseLabel})</span>
+                            </div>
+                            <div class="flex items-center justify-between sm:justify-end gap-3 mt-1 sm:mt-0">
+                                <span class="text-slate-400">${dueLabel}</span>
+                                <span class="font-bold text-amber-300">${amtLabel}</span>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } else if (serviciosMes.length > 0) {
+                pendingSummaryBox.classList.remove('hidden');
+                pendingListEl.innerHTML = `
+                    <div class="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-3.5 py-2.5 rounded-xl text-xs font-medium flex items-center gap-2">
+                        <i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0"></i>
+                        ¡Todo al día! No queda ninguna cuenta pendiente por pagar en ${MONTH_NAMES[currentMonth]} ${currentYear}.
+                    </div>
+                `;
+            } else {
+                pendingSummaryBox.classList.add('hidden');
+            }
+        }
+
+        function renderApp(casas, servicios, allServicios, plantillas = []) {
+            updateMonthStatusBanner(servicios, allServicios);
+
+            let totalPaid = 0, totalPending = 0, totalOverdue = 0;
+            const todayStr = new Date().toISOString().split('T')[0];
+
+            servicios.forEach(s => {
+                const amt = Number(s.amount || 0);
+                if (s.status === 'pagado') totalPaid += amt;
+                else if (s.dueDate && s.dueDate < todayStr) totalOverdue += amt;
+                else totalPending += amt;
+            });
+
+            document.getElementById('stat-paid').innerText = formatCLP(totalPaid);
+            document.getElementById('stat-pending').innerText = formatCLP(totalPending);
+            document.getElementById('stat-overdue').innerText = formatCLP(totalOverdue);
+
+            const container = document.getElementById('houses-container');
+            container.innerHTML = '';
+
+            if (casas.length === 0) {
+                container.innerHTML = `<div class="bg-slate-800 border border-slate-700 p-6 sm:p-8 rounded-2xl text-center text-sm text-slate-400">No tienes propiedades registradas. Haz clic en "Nueva Casa" para comenzar.</div>`;
+                lucide.createIcons();
+                return;
+            }
+
+            casas.forEach(casa => {
+                const casaServicios = servicios.filter(s => s.houseId === casa.id);
+                const casaPlantillas = plantillas.filter(p => p.houseId === casa.id);
+                
+                let housePaid = 0, housePending = 0, houseOverdue = 0;
+
+                casaServicios.forEach(s => {
+                    const amt = Number(s.amount || 0);
+                    if (s.status === 'pagado') housePaid += amt;
+                    else if (s.dueDate && s.dueDate < todayStr) houseOverdue += amt;
+                    else housePending += amt;
+                });
+
+                const houseAllPaid = casaServicios.length > 0 && casaServicios.every(s => s.status === 'pagado');
+                const houseBadge = casaServicios.length === 0
+                    ? ''
+                    : houseAllPaid
+                    ? `<span class="px-2 py-0.5 bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold uppercase rounded-md ml-1">Pagado</span>`
+                    : `<span class="px-2 py-0.5 bg-amber-500/15 text-amber-400 border border-amber-500/30 text-[10px] font-bold uppercase rounded-md ml-1">Pendiente</span>`;
+
+                let servHtml = casaServicios.length === 0
+                    ? `<p class="text-sm text-slate-500 py-2">No hay servicios registrados para este mes.</p>`
+                    : `<div class="divide-y divide-slate-700/50">`;
+                
+                casaServicios.forEach(s => {
+                    const amt = Number(s.amount || 0);
+                    const needsData = amt === 0 || !s.dueDate;
+                    let isOverdue = s.status !== 'pagado' && s.dueDate && s.dueDate < todayStr;
+                    
+                    let badge = s.status === 'pagado'
+                        ? `<span class="px-2.5 py-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 text-xs font-medium rounded-lg w-full sm:w-auto text-center">Pagado</span>`
+                        : needsData
+                        ? `<span class="px-2.5 py-1 bg-sky-500/10 text-sky-400 border border-sky-500/30 text-xs font-medium rounded-lg w-full sm:w-auto text-center">Por Ingresar</span>`
+                        : isOverdue
+                        ? `<span class="px-2.5 py-1 bg-rose-500/10 text-rose-400 border border-rose-500/30 text-xs font-medium rounded-lg w-full sm:w-auto text-center">Vencido</span>`
+                        : `<span class="px-2.5 py-1 bg-amber-500/10 text-amber-400 border border-amber-500/30 text-xs font-medium rounded-lg w-full sm:w-auto text-center">Pendiente</span>`;
+
+                    let fixedTag = s.templateId
+                        ? (s.isFixedAmount
+                            ? `<span class="ml-1.5 px-1.5 py-0.5 bg-indigo-500/20 text-indigo-300 text-[10px] rounded font-medium">Fijo Mensual</span>`
+                            : `<span class="ml-1.5 px-1.5 py-0.5 bg-slate-700 text-slate-300 text-[10px] rounded font-medium">Cuenta Fija</span>`)
+                        : '';
+
+                    servHtml += `
+                        <div class="py-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                            <div class="w-full sm:w-auto">
+                                <h4 class="font-medium text-sm text-slate-200 flex items-center flex-wrap">${s.name}${fixedTag}</h4>
+                                <p class="text-xs text-slate-400 mt-1">
+                                    Vence: <span class="${!s.dueDate ? 'text-sky-400 font-medium' : 'text-slate-300'}">${s.dueDate || 'Sin fecha'}</span> 
+                                    • Monto: <span class="${amt === 0 ? 'text-sky-400 font-semibold' : 'text-slate-200 font-semibold'}">${amt === 0 ? 'Por definir ($0)' : formatCLP(amt)}</span>
+                                </p>
+                                ${s.paymentDate ? `<p class="text-xs text-emerald-400 mt-1">Pagado el: ${s.paymentDate}</p>` : ''}
+                                ${s.proof ? `<button onclick="window.viewProof('${s.id}')" class="inline-flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 hover:underline mt-1.5 touch-manipulation"><i data-lucide="eye" class="w-3.5 h-3.5"></i> Ver Comprobante</button>` : ''}
+                            </div>
+                            
+                            <!-- Botones apilados en móvil, en línea en PC -->
+                            <div class="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 w-full sm:w-auto mt-1 sm:mt-0">
+                                <div class="col-span-2 sm:col-span-1 mb-1 sm:mb-0">
+                                    ${badge}
+                                </div>
+                                <button onclick="window.openEditServiceModal('${s.id}')" class="px-2.5 py-2 sm:py-1.5 bg-slate-700 hover:bg-indigo-600/80 text-slate-200 rounded-xl text-xs font-medium transition flex items-center justify-center gap-1 touch-manipulation" title="Ingresar / Editar Monto y Vencimiento">
+                                    <i data-lucide="pencil" class="w-3.5 h-3.5"></i> ${needsData ? 'Datos' : 'Editar'}
+                                </button>
+                                <button onclick="window.togglePay('${s.id}', '${s.status}')" class="px-3 py-2 sm:py-1.5 ${s.status === 'pagado' ? 'bg-slate-700 hover:bg-slate-600' : 'bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30'} rounded-xl text-xs font-medium transition flex items-center justify-center touch-manipulation">
+                                    ${s.status === 'pagado' ? 'Pendiente' : 'Pagar'}
+                                </button>
+                                <input type="file" id="file-${s.id}" class="hidden" accept="image/*" onchange="window.uploadProof(event, '${s.id}')">
+                                <button onclick="document.getElementById('file-${s.id}').click()" class="p-2 sm:p-1.5 bg-slate-700 hover:bg-slate-600 rounded-xl transition flex items-center justify-center touch-manipulation" title="Adjuntar Comprobante"><i data-lucide="paperclip" class="w-4 h-4 text-slate-300"></i></button>
+                                <button onclick="window.deleteService('${s.id}')" class="p-2 sm:p-1.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-400 rounded-xl transition flex items-center justify-center touch-manipulation" title="Eliminar este mes"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                            </div>
+                        </div>`;
+                });
+                if (casaServicios.length > 0) servHtml += `</div>`;
+
+                const card = document.createElement('div');
+                card.className = 'bg-slate-800 border border-slate-700 rounded-2xl p-4 sm:p-6 shadow-xl';
+                card.innerHTML = `
+                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4 pb-3 border-b border-slate-700">
+                        <div>
+                            <h3 class="text-lg font-bold text-indigo-400 flex items-center gap-2">
+                                <i data-lucide="building" class="w-5 h-5 shrink-0"></i> ${casa.name} ${houseBadge}
+                            </h3>
+                            <div class="flex flex-wrap items-center gap-2 sm:gap-3 mt-2 text-xs">
+                                <span class="text-emerald-400 font-medium">Pagado: ${formatCLP(housePaid)}</span>
+                                <span class="text-slate-600 hidden sm:inline">•</span>
+                                <span class="text-amber-400 font-medium">Pend: ${formatCLP(housePending)}</span>
+                                ${houseOverdue > 0 ? `<span class="text-slate-600 hidden sm:inline">•</span><span class="text-rose-400 font-medium">Venc: ${formatCLP(houseOverdue)}</span>` : ''}
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 w-full sm:w-auto mt-2 sm:mt-0">
+                            <button onclick="window.openTemplatesModal('${casa.id}', '${casa.name.replace(/'/g, "\'")}')" class="col-span-2 sm:col-span-1 px-3 py-2 sm:py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-xl text-xs font-medium transition flex items-center justify-center gap-1 touch-manipulation" title="Gestionar cuentas fijas recurrentes">
+                                <i data-lucide="repeat" class="w-3.5 h-3.5 text-indigo-400"></i> Cuentas Fijas (${casaPlantillas.length})
+                            </button>
+                            <button onclick="window.openAddServiceModal('${casa.id}')" class="px-3 py-2 sm:py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-xs font-medium transition flex items-center justify-center gap-1 touch-manipulation">
+                                <i data-lucide="plus" class="w-3.5 h-3.5"></i> Agregar
+                            </button>
+                            <button onclick="window.deleteHouse('${casa.id}')" class="p-2 sm:p-1.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-400 rounded-xl transition flex items-center justify-center touch-manipulation" title="Eliminar Casa y sus servicios">
+                                <i data-lucide="trash-2" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                    </div>
+                    ${servHtml}`;
+                container.appendChild(card);
+            });
+            lucide.createIcons();
+        }
+
+        window.openAddServiceModal = (houseId) => {
+            document.getElementById('service-house-id').value = houseId;
+            document.getElementById('form-service').reset();
+            document.getElementById('recurring-options-box').classList.add('hidden');
+            document.getElementById('fixed-day-box').classList.add('hidden');
+            document.getElementById('modal-service').classList.remove('hidden');
+        };
+
+        window.openEditServiceModal = (id) => {
+            const serv = allUserServicios.find(s => s.id === id);
+            if (!serv) return;
+            document.getElementById('edit-service-id').value = serv.id;
+            document.getElementById('edit-service-template-id').value = serv.templateId || '';
+            document.getElementById('edit-service-name').value = serv.name;
+            document.getElementById('edit-service-amount').value = serv.amount > 0 ? serv.amount : '';
+            document.getElementById('edit-service-duedate').value = serv.dueDate || '';
+            
+            const tplBox = document.getElementById('edit-template-option-box');
+            const tplCheck = document.getElementById('edit-update-template');
+            tplCheck.checked = false;
+            if (serv.templateId) {
+                tplBox.classList.remove('hidden');
+            } else {
+                tplBox.classList.add('hidden');
+            }
+            document.getElementById('modal-edit-service').classList.remove('hidden');
+        };
+
+        window.openTemplatesModal = async (houseId, houseName) => {
+            document.getElementById('templates-house-title').innerText = houseName;
+            const listContainer = document.getElementById('templates-list');
+            listContainer.innerHTML = '<p class="text-xs text-slate-400">Cargando cuentas fijas...</p>';
+            document.getElementById('modal-templates').classList.remove('hidden');
+
+            const tpls = plantillasCache.filter(p => p.houseId === houseId);
+            
+            if (tpls.length === 0) {
+                listContainer.innerHTML = '<p class="text-xs text-slate-400 py-3 text-center">No hay cuentas fijas configuradas para esta propiedad. Al agregar un servicio, marca la casilla "Dejar cuenta fija para todos los meses".</p>';
+                return;
+            }
+
+            let html = '';
+            tpls.forEach(t => {
+                const detail = t.isFixedAmount
+                    ? `Monto fijo: ${formatCLP(t.fixedAmount)} • Vence el día ${t.fixedDay}`
+                    : `Monto y vencimiento variable ($0)`;
+                html += `
+                    <div class="p-3 bg-slate-900 border border-slate-700 rounded-xl flex justify-between items-center gap-2">
+                        <div class="flex-1 min-w-0">
+                            <p class="text-sm font-semibold text-slate-200 truncate">${t.name}</p>
+                            <p class="text-xs text-slate-400 truncate">${detail}</p>
+                        </div>
+                        <button onclick="window.deleteTemplate('${t.id}', '${houseId}', '${houseName.replace(/'/g, "\'")}')" class="p-2 bg-rose-600/20 text-rose-400 hover:bg-rose-600/30 rounded-lg text-xs shrink-0 touch-manipulation" title="Dejar de repetir en meses futuros">
+                            <i data-lucide="trash-2" class="w-4 h-4"></i>
+                        </button>
+                    </div>`;
+            });
+            listContainer.innerHTML = html;
+            lucide.createIcons();
+        };
+
+        window.deleteTemplate = async (tplId, houseId, houseName) => {
+            if (!confirm('¿Eliminar esta cuenta fija? Ya no se creará automáticamente en los próximos meses (los meses ya creados no se borrarán).')) return;
+            
+            plantillasCache = plantillasCache.filter(p => p.id !== tplId);
+            window.openTemplatesModal(houseId, houseName);
+            renderFilteredData();
+
+            await deleteDoc(doc(db, 'plantillas_servicios', tplId));
+        };
+
+        window.resetMonth = async () => {
+            const monthName = MONTH_NAMES[currentMonth];
+            if (cachedServicios.length === 0) {
+                alert(`No hay servicios registrados en ${monthName} ${currentYear} para reiniciar.`);
+                return;
+            }
+            
+            if (!confirm(`¿Estás seguro de reiniciar todos los servicios de ${monthName} ${currentYear}?\n\nSe borrarán los montos, fechas de vencimiento, comprobantes y volverán a estado Pendiente.`)) return;
+
+            cachedServicios.forEach(s => {
+                s.status = 'pendiente';
+                s.paymentDate = null;
+                s.proof = null;
+                s.amount = 0;
+                s.dueDate = null;
+            });
+            
+            allUserServicios.forEach(s => {
+                if (s.month === currentMonth && s.year === currentYear) {
+                    s.status = 'pendiente';
+                    s.paymentDate = null;
+                    s.proof = null;
+                    s.amount = 0;
+                    s.dueDate = null;
+                }
+            });
+
+            renderFilteredData();
+
+            const batch = writeBatch(db);
+            cachedServicios.forEach(s => {
+                batch.update(doc(db, 'servicios', s.id), {
+                    status: 'pendiente',
+                    paymentDate: null,
+                    proof: null,
+                    amount: 0,
+                    dueDate: null
+                });
+            });
+
+            try {
+                await batch.commit();
+            } catch (e) {
+                console.error(e);
+                alert('Hubo un error al reiniciar en Firebase. Recargando datos...');
+                loadData();
+            }
+        };
+
+        window.togglePay = async (id, status) => {
+            const st = status === 'pagado' ? 'pendiente' : 'pagado';
+            const payDate = st === 'pagado' ? new Date().toLocaleString('es-CL') : null;
+            
+            const servAll = allUserServicios.find(s => s.id === id);
+            if (servAll) { servAll.status = st; servAll.paymentDate = payDate; }
+            const servCached = cachedServicios.find(s => s.id === id);
+            if (servCached) { servCached.status = st; servCached.paymentDate = payDate; }
+            
+            renderFilteredData();
+
+            try {
+                await updateDoc(doc(db, 'servicios', id), {
+                    status: st,
+                    paymentDate: payDate
+                });
+            } catch (error) {
+                console.error(error);
+                alert('Error al actualizar el estado. Revisa tu conexión.');
+                loadData();
+            }
+        };
+
+        window.uploadProof = async (event, id) => {
+            const f = event.target.files[0];
+            if (!f) return;
+            try {
+                const compressedBase64 = await compressImage(f, 900, 0.72);
+                
+                const servAll = allUserServicios.find(s => s.id === id);
+                if (servAll) servAll.proof = compressedBase64;
+                const servCached = cachedServicios.find(s => s.id === id);
+                if (servCached) servCached.proof = compressedBase64;
+                
+                renderFilteredData();
+
+                await updateDoc(doc(db, 'servicios', id), { proof: compressedBase64 });
+            } catch (err) {
+                console.error(err);
+                alert('Error al procesar o subir la imagen del comprobante.');
+                loadData();
+            }
+        };
+
+        window.viewProof = (id) => {
+            const serv = allUserServicios.find(s => s.id === id);
+            if (!serv || !serv.proof) return;
+            document.getElementById('proof-modal-title').innerText = `Comprobante: ${serv.name}`;
+            document.getElementById('proof-modal-subtitle').innerText = serv.paymentDate ? `Pagado el ${serv.paymentDate}` : 'Comprobante adjunto';
+            document.getElementById('proof-modal-img').src = serv.proof;
+            document.getElementById('proof-modal-download').href = serv.proof;
+            document.getElementById('proof-modal-download').download = `Comprobante_${serv.name.replace(/\s+/g, '_')}.jpg`;
+            document.getElementById('modal-proof').classList.remove('hidden');
+            lucide.createIcons();
+        };
+
+        window.closeProofModal = () => {
+            document.getElementById('modal-proof').classList.add('hidden');
+            document.getElementById('proof-modal-img').src = '';
+        };
+
+        window.deleteService = async (id) => {
+            if (!confirm('¿Eliminar este servicio del mes actual?')) return;
+            
+            try {
+                allUserServicios = allUserServicios.filter(s => s.id !== id);
+                cachedServicios = cachedServicios.filter(s => s.id !== id);
+                renderFilteredData();
+
+                await deleteDoc(doc(db, 'servicios', id));
+            } catch (e) {
+                console.error("Error al eliminar servicio:", e);
+                alert('Hubo un error de red o de permisos al intentar eliminar el servicio. Recargando datos...');
+                loadData();
+            }
+        };
+
+        window.deleteHouse = async (houseId) => {
+            if (!confirm('¿Eliminar esta casa y TODOS sus servicios y cuentas fijas asociadas? Esta acción no se puede deshacer.')) return;
+            
+            try {
+                const [snapServ, snapTpl] = await Promise.all([
+                    getDocs(query(collection(db, 'servicios'), where('userId', '==', currentUser.uid), where('houseId', '==', houseId))),
+                    getDocs(query(collection(db, 'plantillas_servicios'), where('userId', '==', currentUser.uid), where('houseId', '==', houseId)))
+                ]);
+
+                const batch = writeBatch(db);
+                batch.delete(doc(db, 'casas', houseId));
+                snapServ.forEach(d => batch.delete(d.ref));
+                snapTpl.forEach(d => batch.delete(d.ref));
+                
+                await batch.commit();
+                
+                cachedCasas = cachedCasas.filter(c => c.id !== houseId);
+                allUserServicios = allUserServicios.filter(s => s.houseId !== houseId);
+                plantillasCache = plantillasCache.filter(p => p.houseId !== houseId);
+                renderFilteredData();
+            } catch (e) {
+                console.error(e);
+                alert('Error al eliminar la casa. Revisa tu conexión.');
+                loadData();
+            }
+        };
+    </script>
+    <style> 
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap'); 
+        body { font-family: 'Inter', sans-serif; -webkit-tap-highlight-color: transparent; } 
+    </style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen flex flex-col items-center justify-center p-3 sm:p-4 overflow-x-hidden">
+
+    <!-- AUTH -->
+    <div id="auth-container" class="w-full max-w-md bg-slate-800 p-6 sm:p-8 rounded-2xl shadow-xl border border-slate-700 hidden">
+        <div class="text-center mb-6">
+            <div class="inline-flex p-3 bg-indigo-600 rounded-xl text-white mb-3"><i data-lucide="home" class="w-8 h-8"></i></div>
+            <h1 id="auth-title" class="text-2xl font-bold">Iniciar Sesión</h1>
+            <p id="auth-subtitle" class="text-slate-400 text-sm mt-1">Ingresa a tus servicios en la nube</p>
+        </div>
+        <div id="auth-error" class="mb-4 p-3 bg-rose-500/10 border border-rose-500/30 text-rose-400 text-sm rounded-xl hidden"></div>
+        <form id="auth-form" class="space-y-4">
+            <div><label class="block text-xs font-medium text-slate-400 mb-1 uppercase">Correo Electrónico</label><input type="email" id="auth-email" required class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl focus:outline-none focus:border-indigo-500 text-base sm:text-sm"></div>
+            <div><label class="block text-xs font-medium text-slate-400 mb-1 uppercase">Contraseña</label><input type="password" id="auth-password" required class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl focus:outline-none focus:border-indigo-500 text-base sm:text-sm"></div>
+            <button type="submit" id="auth-submit-btn" class="w-full py-3 bg-indigo-600 hover:bg-indigo-500 font-medium rounded-xl transition shadow-lg shadow-indigo-600/30 touch-manipulation text-base sm:text-sm">Iniciar Sesión</button>
+        </form>
+        <div class="text-center mt-6"><button type="button" id="auth-toggle-mode" class="text-sm text-indigo-400 hover:underline touch-manipulation py-2">¿No tienes cuenta? Regístrate</button></div>
+    </div>
+
+    <!-- APP -->
+    <div id="app-container" class="w-full max-w-5xl hidden flex flex-col gap-4 sm:gap-6">
+        <header class="bg-slate-800 border border-slate-700 p-4 sm:p-6 rounded-2xl flex justify-between items-center shadow-xl">
+            <div class="flex items-center gap-3">
+                <div class="p-2 sm:p-3 bg-indigo-600 rounded-xl text-white"><i data-lucide="home" class="w-5 h-5 sm:w-6 sm:h-6"></i></div>
+                <div>
+                    <h1 class="text-base sm:text-xl font-bold leading-tight">Gestor de Pagos</h1>
+                    <p id="user-email-display" class="text-[10px] sm:text-xs text-slate-400 truncate max-w-[120px] sm:max-w-none"></p>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <!-- BOTÓN DE NOTIFICACIONES AGREGADO AQUÍ -->
+                <button id="btn-notifications" class="px-2 sm:px-3 py-2 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-400 border border-emerald-500/30 rounded-xl text-xs sm:text-sm font-medium transition flex items-center gap-2 touch-manipulation" title="Activar Recordatorios">
+                    <i data-lucide="bell" class="w-4 h-4"></i> <span class="hidden sm:inline">Recordatorios</span>
+                </button>
+                <button id="logout-btn" class="px-3 sm:px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-xs sm:text-sm font-medium transition flex items-center gap-2 touch-manipulation">
+                    <i data-lucide="log-out" class="w-4 h-4"></i> <span class="hidden sm:inline">Cerrar Sesión</span>
+                </button>
+            </div>
+        </header>
+
+        <!-- BARRA DE NAVEGACIÓN DE MES -->
+        <div class="bg-slate-800 border border-slate-700 p-3 sm:p-4 rounded-2xl flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 shadow-lg">
+            <div class="flex flex-wrap items-center justify-center lg:justify-start w-full lg:w-auto gap-2">
+                <button id="prev-month" class="p-2 sm:p-2.5 bg-slate-700 hover:bg-slate-600 rounded-xl transition touch-manipulation"><i data-lucide="chevron-left" class="w-5 h-5"></i></button>
+                <select id="select-month" class="bg-slate-900 border border-slate-700 px-2 sm:px-3 py-2 rounded-xl text-base sm:text-sm font-medium focus:outline-none flex-1 sm:flex-none text-center">
+                    <option value="0">Enero</option><option value="1">Febrero</option><option value="2">Marzo</option><option value="3">Abril</option><option value="4">Mayo</option><option value="5">Junio</option><option value="6">Julio</option><option value="7">Agosto</option><option value="8">Septiembre</option><option value="9">Octubre</option><option value="10">Noviembre</option><option value="11">Diciembre</option>
+                </select>
+                <select id="select-year" class="bg-slate-900 border border-slate-700 px-2 sm:px-3 py-2 rounded-xl text-base sm:text-sm font-medium focus:outline-none flex-1 sm:flex-none text-center">
+                    <option value="2025">2025</option><option value="2026">2026</option><option value="2027">2027</option><option value="2028">2028</option>
+                </select>
+                <button id="next-month" class="p-2 sm:p-2.5 bg-slate-700 hover:bg-slate-600 rounded-xl transition touch-manipulation"><i data-lucide="chevron-right" class="w-5 h-5"></i></button>
+                
+                <span id="month-status-badge" class="px-3 py-1.5 rounded-full text-[11px] sm:text-xs font-bold uppercase tracking-wider bg-slate-700 text-slate-300">CARGANDO...</span>
+            </div>
+
+            <div class="flex flex-col sm:flex-row items-stretch sm:items-center justify-between w-full lg:w-auto gap-3">
+                <div class="bg-slate-900/90 border border-slate-700 px-3 py-2 rounded-xl flex items-center justify-center sm:justify-start gap-2 text-xs w-full sm:w-auto">
+                    <i data-lucide="calendar-check" class="w-4 h-4 text-emerald-400 shrink-0"></i>
+                    <div class="text-center sm:text-left">
+                        <span class="text-slate-400 block text-[10px] uppercase tracking-wider">Último mes pagado</span>
+                        <span id="last-paid-month-text" class="text-slate-200 font-medium">Calculando...</span>
+                    </div>
+                </div>
+
+                <div class="flex items-center gap-2 w-full sm:w-auto">
+                    <button onclick="window.resetMonth()" class="flex-1 sm:flex-none px-3 py-2.5 bg-rose-600/20 hover:bg-rose-600/30 text-rose-400 border border-rose-500/30 rounded-xl text-xs font-medium transition flex items-center justify-center gap-1.5 touch-manipulation" title="Marcar todos los servicios del mes actual como pendientes y borrar montos">
+                        <i data-lucide="rotate-ccw" class="w-4 h-4"></i> Reiniciar
+                    </button>
+
+                    <button id="btn-add-house" class="flex-1 sm:flex-none px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-xs sm:text-sm font-medium transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/30 touch-manipulation">
+                        <i data-lucide="plus" class="w-4 h-4"></i> Nueva Casa
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- RESUMEN DE LO QUE FALTA POR PAGAR EN EL MES -->
+        <div id="pending-summary-box" class="bg-slate-800/90 border border-slate-700 p-3 sm:p-4 rounded-2xl shadow-lg hidden">
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-[11px] sm:text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                    <i data-lucide="list-todo" class="w-4 h-4 text-amber-400"></i> Cuentas por Pagar este Mes
+                </h3>
+            </div>
+            <div id="pending-items-list" class="grid grid-cols-1 md:grid-cols-2 gap-2"></div>
+        </div>
+
+        <!-- TARJETAS DE TOTALES -->
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
+            <div class="bg-slate-800 border border-slate-700 p-4 sm:p-5 rounded-2xl"><p class="text-[11px] sm:text-xs font-medium text-slate-400 uppercase tracking-wider">Total Pagado (Mes)</p><h3 id="stat-paid" class="text-xl sm:text-2xl font-bold text-emerald-400 mt-1">$0</h3></div>
+            <div class="bg-slate-800 border border-slate-700 p-4 sm:p-5 rounded-2xl"><p class="text-[11px] sm:text-xs font-medium text-slate-400 uppercase tracking-wider">Total Pendiente (Mes)</p><h3 id="stat-pending" class="text-xl sm:text-2xl font-bold text-amber-400 mt-1">$0</h3></div>
+            <div class="bg-slate-800 border border-slate-700 p-4 sm:p-5 rounded-2xl"><p class="text-[11px] sm:text-xs font-medium text-slate-400 uppercase tracking-wider">Total Vencido (Mes)</p><h3 id="stat-overdue" class="text-xl sm:text-2xl font-bold text-rose-400 mt-1">$0</h3></div>
+        </div>
+
+        <div id="houses-container" class="space-y-4 sm:space-y-6"></div>
+    </div>
+
+    <!-- MODAL NUEVA CASA -->
+    <div id="modal-house" class="fixed inset-0 bg-black/60 backdrop-blur-sm hidden flex items-center justify-center p-3 sm:p-4 z-50">
+        <div class="bg-slate-800 border border-slate-700 w-full max-w-md p-5 sm:p-6 rounded-2xl shadow-2xl">
+            <h3 class="text-lg font-bold mb-4">Nueva Casa o Propiedad</h3>
+            <form id="form-house" class="space-y-4">
+                <div><label class="block text-xs font-medium text-slate-400 mb-1 uppercase">Nombre</label><input type="text" id="house-name" placeholder="Ej: CASA MAMÁ" required class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl text-base sm:text-sm focus:outline-none"></div>
+                <div class="flex justify-end gap-3 pt-2"><button type="button" id="close-modal-house" class="px-4 py-2.5 bg-slate-700 rounded-xl text-sm touch-manipulation">Cancelar</button><button type="submit" class="px-4 py-2.5 bg-indigo-600 rounded-xl text-sm touch-manipulation">Guardar</button></div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL AGREGAR SERVICIO -->
+    <div id="modal-service" class="fixed inset-0 bg-black/60 backdrop-blur-sm hidden flex items-center justify-center p-3 sm:p-4 z-50">
+        <div class="bg-slate-800 border border-slate-700 w-full max-w-md p-5 sm:p-6 rounded-2xl shadow-2xl max-h-[90vh] overflow-y-auto">
+            <h3 class="text-lg font-bold mb-4">Agregar Servicio</h3>
+            <form id="form-service" class="space-y-4">
+                <input type="hidden" id="service-house-id">
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1 uppercase">Nombre del Servicio</label>
+                    <input type="text" id="service-name" placeholder="Ej: Luz, Agua, Cable" required class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl text-base sm:text-sm focus:outline-none">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1 uppercase">Monto CLP (Opcional)</label>
+                    <input type="number" id="service-amount" step="1" min="0" placeholder="Ej: 25000" class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl text-base sm:text-sm focus:outline-none">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1 uppercase">Fecha de Vencimiento (Opcional)</label>
+                    <input type="date" id="service-duedate" class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl text-base sm:text-sm focus:outline-none">
+                </div>
+
+                <div class="p-3.5 bg-slate-900/80 border border-slate-700 rounded-xl space-y-3">
+                    <label class="flex items-start gap-2.5 cursor-pointer touch-manipulation">
+                        <input type="checkbox" id="service-is-recurring" class="mt-0.5 w-4 h-4 rounded bg-slate-800 border-slate-600 text-indigo-600 focus:ring-0">
+                        <div>
+                            <span class="text-xs font-semibold text-slate-200 block">Dejar cuenta fija para todos los meses</span>
+                            <span class="text-[11px] text-slate-400 block">Se creará automáticamente cada mes en $0.</span>
+                        </div>
+                    </label>
+
+                    <div id="recurring-options-box" class="hidden pl-6 pt-2 border-t border-slate-800 space-y-3">
+                        <label class="flex items-start gap-2.5 cursor-pointer touch-manipulation">
+                            <input type="checkbox" id="service-is-fixed-amount" class="mt-0.5 w-4 h-4 rounded bg-slate-800 border-slate-600 text-indigo-600 focus:ring-0">
+                            <div>
+                                <span class="text-xs font-semibold text-indigo-300 block">Es monto y día fijo (ej. Internet)</span>
+                            </div>
+                        </label>
+
+                        <div id="fixed-day-box" class="hidden">
+                            <label class="block text-[11px] font-medium text-slate-400 mb-1 uppercase">Día de vencimiento (1-31)</label>
+                            <input type="number" id="service-fixed-day" min="1" max="31" placeholder="Ej: 15" class="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-base sm:text-sm focus:outline-none">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flex justify-end gap-3 pt-2">
+                    <button type="button" id="close-modal-service" class="px-4 py-2.5 bg-slate-700 rounded-xl text-sm touch-manipulation">Cancelar</button>
+                    <button type="submit" class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-sm font-medium touch-manipulation">Guardar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL EDITAR SERVICIO -->
+    <div id="modal-edit-service" class="fixed inset-0 bg-black/60 backdrop-blur-sm hidden flex items-center justify-center p-3 sm:p-4 z-50">
+        <div class="bg-slate-800 border border-slate-700 w-full max-w-md p-5 sm:p-6 rounded-2xl shadow-2xl">
+            <h3 class="text-lg font-bold mb-4">Editar Datos de Servicio</h3>
+            <form id="form-edit-service" class="space-y-4">
+                <input type="hidden" id="edit-service-id">
+                <input type="hidden" id="edit-service-template-id">
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1 uppercase">Servicio</label>
+                    <input type="text" id="edit-service-name" required class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl text-base sm:text-sm focus:outline-none">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1 uppercase">Monto CLP</label>
+                    <input type="number" id="edit-service-amount" step="1" min="0" placeholder="Ej: 28500" required class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl text-base sm:text-sm focus:outline-none">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1 uppercase">Fecha de Vencimiento</label>
+                    <input type="date" id="edit-service-duedate" required class="w-full px-4 py-3 bg-slate-900 border border-slate-700 rounded-xl text-base sm:text-sm focus:outline-none">
+                </div>
+                <div id="edit-template-option-box" class="hidden p-3 bg-slate-900/80 border border-slate-700 rounded-xl">
+                    <label class="flex items-start gap-2 cursor-pointer touch-manipulation">
+                        <input type="checkbox" id="edit-update-template" class="mt-0.5 w-4 h-4 rounded bg-slate-800 border-slate-600 text-indigo-600">
+                        <span class="text-xs text-slate-300">Actualizar también la plantilla fija para próximos meses</span>
+                    </label>
+                </div>
+                <div class="flex justify-end gap-3 pt-2">
+                    <button type="button" id="close-modal-edit-service" class="px-4 py-2.5 bg-slate-700 rounded-xl text-sm touch-manipulation">Cancelar</button>
+                    <button type="submit" class="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-sm font-medium touch-manipulation">Guardar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- MODAL GESTIÓN DE CUENTAS FIJAS -->
+    <div id="modal-templates" class="fixed inset-0 bg-black/60 backdrop-blur-sm hidden flex items-center justify-center p-3 sm:p-4 z-50">
+        <div class="bg-slate-800 border border-slate-700 w-full max-w-md p-5 sm:p-6 rounded-2xl shadow-2xl space-y-4">
+            <div class="flex justify-between items-center border-b border-slate-700 pb-3">
+                <div class="flex-1 min-w-0 pr-2">
+                    <h3 class="text-base sm:text-lg font-bold">Cuentas Fijas</h3>
+                    <p id="templates-house-title" class="text-xs text-indigo-400 font-medium truncate"></p>
+                </div>
+                <button type="button" id="close-modal-templates" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded-lg text-xs touch-manipulation">Cerrar</button>
+            </div>
+            <div id="templates-list" class="space-y-2.5 max-h-[60vh] overflow-y-auto"></div>
+        </div>
+    </div>
+
+    <!-- MODAL VER COMPROBANTE -->
+    <div id="modal-proof" onclick="if(event.target === this) window.closeProofModal()" class="fixed inset-0 bg-black/75 backdrop-blur-sm hidden flex items-center justify-center p-3 sm:p-4 z-50">
+        <div class="bg-slate-800 border border-slate-700 w-full max-w-lg rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]">
+            <div class="flex items-center justify-between px-4 py-3 border-b border-slate-700 bg-slate-800/95">
+                <div class="flex-1 min-w-0 pr-2">
+                    <h3 id="proof-modal-title" class="text-sm font-bold text-slate-100 truncate">Comprobante</h3>
+                    <p id="proof-modal-subtitle" class="text-[10px] sm:text-[11px] text-slate-400 truncate"></p>
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                    <a id="proof-modal-download" href="#" download="comprobante.jpg" class="px-2.5 py-1.5 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 rounded-lg text-xs font-medium transition flex items-center gap-1 touch-manipulation" title="Descargar imagen">
+                        <i data-lucide="download" class="w-3.5 h-3.5"></i> <span class="hidden sm:inline">Descargar</span>
+                    </a>
+                    <button type="button" onclick="window.closeProofModal()" class="p-1.5 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded-lg transition touch-manipulation" title="Cerrar">
+                        <i data-lucide="x" class="w-5 h-5"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="p-2 sm:p-4 bg-slate-950/90 flex items-center justify-center overflow-auto">
+                <img id="proof-modal-img" src="" alt="Comprobante" class="max-h-[70vh] w-auto rounded-lg object-contain shadow-lg border border-slate-800" />
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>

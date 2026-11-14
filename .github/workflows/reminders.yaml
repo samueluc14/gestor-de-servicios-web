@@ -1,0 +1,25 @@
+name: Enviar Recordatorios de Pago
+on:
+  schedule:
+    # Se ejecuta cada hora en punto (ej. 1:00, 2:00, 3:00...)
+    - cron: '0 * * * *'
+  workflow_dispatch: # Permite ejecutarlo manualmente para probar
+
+jobs:
+  send-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          
+      - name: Instalar dependencias
+        run: npm install firebase-admin
+        
+      - name: Ejecutar script de recordatorios
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: node scripts/send-reminders.js
